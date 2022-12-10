@@ -4,9 +4,20 @@
 #include <concepts>
 #include <type_traits>
 #include <utility>
+#include <variant>
+#include <optional>
 
 namespace tmplt::fsm
 {
+
+template<typename ... T>
+struct type_tag_t
+{
+    explicit constexpr type_tag_t() = default;
+};
+
+template<typename ... T>
+inline constexpr type_tag_t<T...> type_tag{};
 
 namespace detail
 {
@@ -31,6 +42,12 @@ using guard_t = decltype(std::remove_cvref_t<T>::guard);
 
 template<typename T>
 using action_t = decltype(std::remove_cvref_t<T>::action);
+
+template<typename T>
+using state_t = typename std::remove_cvref_t<T>::state_t;
+
+template<typename T>
+using transitions_t = typename std::remove_cvref_t<T>::transitions_t;
 
 template<typename T, typename ... Args>
 concept nothrow_constructible_from = requires
@@ -67,6 +84,18 @@ concept transition_action = requires
     requires std::regular_invocable<add_const_lvalue_reference_t<Action>, add_const_lvalue_reference_t<Event>>;
     requires std::same_as<std::invoke_result_t<add_const_lvalue_reference_t<Action>, add_const_lvalue_reference_t<Event>>, void>;
 };
+
+template<typename State, std::size_t ... I>
+[[nodiscard]] consteval bool state_invocable(std::index_sequence<I...>) noexcept
+{
+    return (std::regular_invocable<add_const_lvalue_reference_t<State>, add_const_lvalue_reference_t<event_t<std::tuple_element_t<I, transitions_t<State>>>>> && ...);
+}
+
+template<typename State, std::size_t ... I>
+[[nodiscard]] consteval bool state_result(std::index_sequence<I...>) noexcept
+{
+    return (std::same_as<std::invoke_result_t<add_const_lvalue_reference_t<State>, add_const_lvalue_reference_t<event_t<std::tuple_element_t<I, transitions_t<State>>>>>, std::optional<std::variant<type_tag_t<destination_t<std::tuple_element_t<I, transitions_t<State>>>>...>>> && ...);
+}
 
 }
 
@@ -150,6 +179,15 @@ public:
     {
         return internal_transition_with_action{std::forward<Transition>(t), std::forward<Action>(a)};
     }
+};
+
+template<typename State>
+concept state = requires
+{
+    requires detail::nothrow_move_constructible<std::remove_cvref_t<State>>;
+    typename detail::state_t<State>;
+    requires detail::state_invocable<State>(std::make_index_sequence<std::tuple_size_v<detail::transitions_t<State>>>{});
+    requires detail::state_result<State>(std::make_index_sequence<std::tuple_size_v<detail::transitions_t<State>>>{});
 };
 
 }
