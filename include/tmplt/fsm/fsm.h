@@ -9,6 +9,7 @@
 #include <optional>
 #include <tuple>
 #include <cstddef>
+#include <functional>
 
 namespace tmplt::fsm
 {
@@ -22,6 +23,11 @@ template<typename ... T>
 struct type_tag_t
 {
     explicit constexpr type_tag_t() = default;
+};
+
+struct invalid_state_t
+{
+    explicit constexpr invalid_state_t() = default;
 };
 
 namespace detail
@@ -44,6 +50,9 @@ using state_t = typename std::remove_cvref_t<T>::state_t;
 
 template<typename T>
 using transitions_t = typename std::remove_cvref_t<T>::transitions_t;
+
+template<typename T>
+using states_t = typename std::remove_cvref_t<T>::states_t;
 
 template<typename Guard, typename Event>
 concept transition_guard = requires
@@ -71,6 +80,30 @@ template<typename State, std::size_t ... I>
 {
     return (std::same_as<std::invoke_result_t<State const&, event_t<std::tuple_element_t<I, transitions_t<State>>> const&>, std::optional<std::variant<type_tag_t<destination_t<std::tuple_element_t<I, transitions_t<State>>>>...>>> && ...);
 }
+
+template<typename StateMachine, typename Event>
+concept state_machine_state_event_processable = requires(StateMachine&& machine, Event const& event)
+{
+    { std::forward<StateMachine>(machine).process_event(event) } -> std::convertible_to<bool>;
+};
+
+template<typename StateMachine, typename State, std::size_t ... I>
+[[nodiscard]] consteval bool state_machine_state_processable(std::index_sequence<I...>) noexcept
+{
+    return (state_machine_state_event_processable<StateMachine, event_t<std::tuple_element_t<I, transitions_t<State>>>> && ...);
+}
+
+template<typename StateMachine, std::size_t ... I>
+[[nodiscard]] consteval bool state_machine_processable(std::index_sequence<I...>) noexcept
+{
+    return (state_machine_state_processable<StateMachine, std::tuple_element_t<I, states_t<StateMachine>>>(std::make_index_sequence<std::tuple_size_v<transitions_t<std::tuple_element_t<I, states_t<StateMachine>>>>>{}) && ...);
+}
+
+template<typename StateMachine>
+concept state_machine_visitable = requires(StateMachine&& machine)
+{
+    std::forward<StateMachine>(machine).visit_state([](auto&&) {});
+};
 
 }
 
@@ -347,6 +380,170 @@ public:
     [[nodiscard]] static constexpr state auto create_state(Transitions&&... transitions) noexcept(noexcept(internal_state{std::declval<type_tag_t<State>>(), std::declval<Transitions>()...}))
     {
         return internal_state{type_tag_t<std::remove_cvref_t<State>>{}, std::forward<Transitions>(transitions)...};
+    }
+};
+
+template<typename StateMachine>
+concept state_machine = requires
+{
+    requires std::copy_constructible<StateMachine>;
+    typename detail::states_t<StateMachine>;
+    requires detail::state_machine_processable<StateMachine>(std::make_index_sequence<std::tuple_size_v<detail::states_t<StateMachine>>>{});
+    requires detail::state_machine_visitable<StateMachine>;
+};
+
+class state_machine_factory
+{
+    template<typename ... States>
+    class internal_state_machine
+    {
+        using current_state_t = std::variant<type_tag_t<States>...>;
+
+        template<typename Event>
+        class internal_event_processor
+        {
+            class index
+            {
+                template<typename Destination, typename Current, typename ... Rest>
+                [[nodiscard]] static consteval auto get_index(std::size_t index, type_tag_t<Current, Rest...>) noexcept
+                {
+                    if constexpr(std::is_same_v<Destination, Current>)
+                    {
+                        return index;
+                    }
+                    else
+                    {
+                        return get_index<Destination>(index + 1, type_tag_t<Rest...>{});
+                    }
+                }
+
+                template<typename>
+                [[nodiscard]] static consteval auto get_index(std::size_t index, type_tag_t<>) noexcept
+                {
+                    return index - 1;
+                }
+
+            public:
+                template<typename Destination>
+                [[nodiscard]] static consteval auto get_for() noexcept
+                {
+                    return get_index<Destination>({}, type_tag_t<detail::state_t<States>...>{});
+                }
+            };
+
+            template<typename Destination>
+            constexpr void make_transition() const noexcept(noexcept(std::declval<current_state_t&>().template emplace<index::template get_for<Destination>()>()))
+            {
+                machine.current_state.template emplace<index::template get_for<Destination>()>();
+            }
+
+            template<typename State, std::size_t ... I>
+            [[nodiscard]] static consteval bool are_transitions_noexcept(std::index_sequence<I...>) noexcept
+            {
+                return (noexcept(std::declval<internal_event_processor const&>().template make_transition<detail::destination_t<std::tuple_element_t<I, detail::transitions_t<State>>>>()) && ...);
+            }
+
+        public:
+            explicit constexpr internal_event_processor(internal_state_machine& machine, Event const& event) noexcept : machine{machine}, event{event}
+            {}
+
+            constexpr bool operator()(auto) const noexcept(noexcept(make_transition<invalid_state_t>()))
+            {
+                make_transition<invalid_state_t>();
+
+                return false;
+            }
+
+            template<typename State>
+            requires std::regular_invocable<State&, Event const&>
+            constexpr bool operator()(type_tag_t<State>) const noexcept(std::is_nothrow_invocable_v<State&, Event const&> && are_transitions_noexcept<State>(std::make_index_sequence<std::tuple_size_v<detail::transitions_t<State>>>{}))
+            {
+                if(auto const destination = std::invoke(get<State>(machine.states), event); destination.has_value())
+                {
+                    std::visit([this]<typename Destination>(type_tag_t<Destination>)
+                    {
+                        make_transition<Destination>();
+                    }, *destination);
+                }
+
+                return true;
+            }
+
+        private:
+            internal_state_machine& machine;
+            Event const& event;
+        };
+
+        template<typename Event>
+        internal_event_processor(internal_state_machine&, Event const&) -> internal_event_processor<Event>;
+
+        template<typename Visitor>
+        class internal_state_visitor
+        {
+        public:
+            template<std::convertible_to<std::add_rvalue_reference_t<Visitor>> T>
+            explicit constexpr internal_state_visitor(T&& visitor) noexcept : visitor{std::forward<Visitor>(visitor)}
+            {}
+
+            template<typename State>
+            constexpr decltype(auto) operator()(type_tag_t<State>) const noexcept(std::is_nothrow_invocable_v<Visitor, type_tag_t<detail::state_t<State>>>)
+            {
+                return std::invoke(std::forward<Visitor>(visitor), type_tag_t<detail::state_t<State>>{});
+            }
+
+        private:
+            std::add_rvalue_reference_t<Visitor> visitor;
+        };
+
+        template<typename Visitor>
+        internal_state_visitor(Visitor&&) -> internal_state_visitor<Visitor>;
+
+    public:
+        using states_t = std::tuple<States...>;
+
+        template<typename ... T>
+        requires (std::constructible_from<States, T> && ...)
+        explicit constexpr internal_state_machine(T&&... states) noexcept(std::is_nothrow_constructible_v<states_t, T...> && std::is_nothrow_constructible_v<current_state_t, std::in_place_index_t<0> const&>) : states{std::forward<T>(states)...}, current_state{std::in_place_index<0>}
+        {}
+
+        template<typename Event>
+        constexpr bool process_event(Event const& event) noexcept(noexcept(std::visit(internal_event_processor{std::declval<internal_state_machine&>(), std::declval<Event const&>()}, std::declval<current_state_t&>())))
+        {
+            return std::visit(internal_event_processor{*this, event}, current_state);
+        }
+
+        template<typename Visitor>
+        requires (std::invocable<Visitor, type_tag_t<detail::state_t<States>>> && ...)
+        constexpr decltype(auto) visit_state(Visitor&& visitor) const noexcept(noexcept(std::visit(internal_state_visitor{std::declval<Visitor>()}, std::declval<current_state_t const&>())))
+        {
+            return std::visit(internal_state_visitor{std::forward<Visitor>(visitor)}, current_state);
+        }
+
+    private:
+        states_t states;
+        current_state_t current_state;
+    };
+
+    template<typename ... States>
+    internal_state_machine(States&&...) -> internal_state_machine<std::remove_cvref_t<States>...>;
+
+    template<typename Current, typename ... Rest>
+    [[nodiscard]] static consteval bool are_all_states_unique(type_tag_t<Current, Rest...>) noexcept
+    {
+        return std::conjunction_v<std::negation<std::is_same<Current, Rest>>...> && are_all_states_unique(type_tag_t<Rest...>{});
+    }
+
+    [[nodiscard]] static consteval bool are_all_states_unique(type_tag_t<>) noexcept
+    {
+        return true;
+    }
+
+public:
+    template<state ... States>
+    requires (are_all_states_unique(type_tag_t<detail::state_t<States>..., invalid_state_t>{}))
+    [[nodiscard]] static constexpr state_machine auto create_state_machine(States&&... states) noexcept(noexcept(internal_state_machine{std::declval<States>()..., state_factory::create_state<invalid_state_t>()}))
+    {
+        return internal_state_machine{std::forward<States>(states)..., state_factory::create_state<invalid_state_t>()};
     }
 };
 
