@@ -4,9 +4,22 @@
 #include <concepts>
 #include <type_traits>
 #include <utility>
+#include <variant>
+#include <optional>
+#include <tuple>
+#include <cstddef>
 
 namespace tmplt::fsm
 {
+
+template<typename ... T>
+struct type_tag_t
+{
+    explicit constexpr type_tag_t() = default;
+};
+
+template<typename ... T>
+inline constexpr type_tag_t<T...> type_tag{};
 
 namespace detail
 {
@@ -31,6 +44,12 @@ using guard_t = decltype(std::remove_cvref_t<T>::guard);
 
 template<typename T>
 using action_t = decltype(std::remove_cvref_t<T>::action);
+
+template<typename T>
+using state_t = typename std::remove_cvref_t<T>::state_t;
+
+template<typename T>
+using transitions_t = typename std::remove_cvref_t<T>::transitions_t;
 
 template<typename T, typename ... Args>
 concept nothrow_constructible_from = requires
@@ -67,6 +86,18 @@ concept transition_action = requires
     requires std::regular_invocable<add_const_lvalue_reference_t<Action>, add_const_lvalue_reference_t<Event>>;
     requires std::same_as<std::invoke_result_t<add_const_lvalue_reference_t<Action>, add_const_lvalue_reference_t<Event>>, void>;
 };
+
+template<typename State, std::size_t ... I>
+[[nodiscard]] consteval bool state_invocable(std::index_sequence<I...>) noexcept
+{
+    return (std::regular_invocable<add_const_lvalue_reference_t<State>, add_const_lvalue_reference_t<event_t<std::tuple_element_t<I, transitions_t<State>>>>> && ...);
+}
+
+template<typename State, std::size_t ... I>
+[[nodiscard]] consteval bool state_result(std::index_sequence<I...>) noexcept
+{
+    return (std::same_as<std::invoke_result_t<add_const_lvalue_reference_t<State>, add_const_lvalue_reference_t<event_t<std::tuple_element_t<I, transitions_t<State>>>>>, std::optional<std::variant<type_tag_t<destination_t<std::tuple_element_t<I, transitions_t<State>>>>...>>> && ...);
+}
 
 }
 
@@ -149,6 +180,206 @@ public:
     [[nodiscard]] friend constexpr transition_with_action auto operator|(Transition&& t, Action&& a) noexcept
     {
         return internal_transition_with_action{std::forward<Transition>(t), std::forward<Action>(a)};
+    }
+};
+
+template<typename State>
+concept state = requires
+{
+    requires detail::nothrow_move_constructible<std::remove_cvref_t<State>>;
+    typename detail::state_t<State>;
+    requires detail::state_invocable<State>(std::make_index_sequence<std::tuple_size_v<detail::transitions_t<State>>>{});
+    requires detail::state_result<State>(std::make_index_sequence<std::tuple_size_v<detail::transitions_t<State>>>{});
+};
+
+class state_factory
+{
+    template<typename State, typename ... Transitions>
+    class internal_state
+    {
+        class transitions_indexes
+        {
+            template<typename Transition, std::size_t Index>
+            struct indexed_transition
+            {
+                using type = Transition;
+
+                static constexpr auto index = Index;
+                static constexpr auto guarded = transition_with_guard<Transition>;
+            };
+
+            template<typename T>
+            using indexed_transition_t = typename T::type;
+
+            template<std::size_t ... Indexes>
+            [[nodiscard]] static consteval auto get_indexed_transitions(std::index_sequence<Indexes...>) noexcept
+            {
+                return type_tag<indexed_transition<Transitions, Indexes>...>;
+            }
+
+            template<typename Event, typename ... Indexed>
+            [[nodiscard]] static consteval auto get_ordered_indexes_for_event(type_tag_t<Indexed...> indexed_transitions) noexcept
+            {
+                return get_indexes_for_event<Event, false>(indexed_transitions, get_indexes_for_event<Event, true>(indexed_transitions, std::index_sequence<>{}));
+            }
+
+            template<typename Event, bool Guarded, typename Current, typename ... Rest, std::size_t ... Indexes>
+            [[nodiscard]] static consteval auto get_indexes_for_event(type_tag_t<Current, Rest...>, std::index_sequence<Indexes...>) noexcept
+            {
+                if constexpr(std::is_same_v<detail::event_t<indexed_transition_t<Current>>, Event> && Guarded == Current::guarded)
+                {
+                    return get_indexes_for_event<Event, Guarded>(type_tag<Rest...>, std::index_sequence<Indexes..., Current::index>{});
+                }
+                else
+                {
+                    return get_indexes_for_event<Event, Guarded>(type_tag<Rest...>, std::index_sequence<Indexes...>{});
+                }
+            }
+
+            template<typename, bool, std::size_t ... Indexes>
+            [[nodiscard]] static consteval auto get_indexes_for_event(type_tag_t<>, std::index_sequence<Indexes...> indexes) noexcept
+            {
+                return indexes;
+            }
+
+        public:
+            template<typename Event>
+            [[nodiscard]] static consteval auto get_for_event() noexcept
+            {
+                constexpr auto indexed_transitions = get_indexed_transitions(std::index_sequence_for<Transitions...>{});
+                if constexpr(constexpr auto indexes = get_ordered_indexes_for_event<Event>(indexed_transitions); indexes.size())
+                {
+                    return indexes;
+                }
+                else
+                {
+                    return get_ordered_indexes_for_event<transition_factory::default_event_t>(indexed_transitions);
+                }
+            }
+        };
+
+        using dispatch_result_t = std::optional<std::variant<type_tag_t<detail::destination_t<Transitions>>...>>;
+
+        template<std::size_t Current, std::size_t ... Rest>
+        [[nodiscard]] constexpr dispatch_result_t dispatch_event(auto const& event, std::index_sequence<Current, Rest...>) const noexcept(noexcept(is_dispatch_noexcept<Current, Rest...>(this, event)))
+        {
+            if(auto const& transition = std::get<Current>(transitions); is_transition_allowed(transition, event))
+            {
+                call_action(transition, event);
+
+                return dispatch_result_t{std::in_place, std::in_place_index<Current>};
+            }
+            else
+            {
+                return dispatch_event(event, std::index_sequence<Rest...>{});
+            }
+        }
+
+        [[nodiscard]] constexpr dispatch_result_t dispatch_event(auto const&, std::index_sequence<>) const noexcept
+        {
+            return std::nullopt;
+        }
+
+        [[nodiscard]] static constexpr bool is_transition_allowed(auto const&, auto const&) noexcept
+        {
+            return true;
+        }
+
+        [[nodiscard]] static constexpr bool is_transition_allowed(transition_with_guard auto const& transition, auto const& event) noexcept(noexcept(transition.guard(event)))
+        {
+            return transition.guard(event);
+        }
+
+        static constexpr void call_action(auto const&, auto const&) noexcept
+        {}
+
+        static constexpr void call_action(transition_with_action auto const& transition, auto const& event) noexcept(noexcept(transition.action(event)))
+        {
+            transition.action(event);
+        }
+
+        template<std::size_t Current, std::size_t ... Rest>
+        [[nodiscard]] static consteval bool is_dispatch_noexcept(auto const& state, auto const& event) noexcept
+        {
+            auto const& transition = std::get<Current>(state.transitions);
+
+            return noexcept(is_transition_allowed(transition, event)) && noexcept(call_action(transition, event)) && noexcept(state.dispatch_event(event, std::index_sequence<Rest...>{}));
+        }
+
+    public:
+        using state_t = State;
+        using transitions_t = std::tuple<Transitions...>;
+
+        template<typename ... T>
+        requires (detail::nothrow_constructible_from<Transitions, T> && ...)
+        explicit constexpr internal_state(type_tag_t<State>, T&&... transitions) noexcept : transitions{std::forward<T>(transitions)...}
+        {}
+
+        template<typename Event>
+        requires ((std::same_as<Event, detail::event_t<Transitions>> || ...) || (std::same_as<transition_factory::default_event_t, detail::event_t<Transitions>> || ...))
+        [[nodiscard]] constexpr auto operator()(Event const& event) const noexcept(noexcept(dispatch_event(event, transitions_indexes::template get_for_event<Event>())))
+        {
+            return dispatch_event(event, transitions_indexes::template get_for_event<Event>());
+        }
+
+    private:
+        transitions_t transitions;
+    };
+
+    template<typename State, typename ... Transitions>
+    internal_state(type_tag_t<State>, Transitions&&...) -> internal_state<State, std::remove_cvref_t<Transitions>...>;
+
+    class transitions_comparator
+    {
+        template<bool ... B>
+        [[nodiscard]] static consteval bool all_or_none() noexcept
+        {
+            return (B && ...) || (!B && ...);
+        }
+
+    public:
+        template<typename LHS, typename RHS>
+        [[nodiscard]] consteval bool operator()(type_tag_t<LHS, RHS>) const noexcept
+        {
+            return false;
+        }
+
+        template<typename LHS, typename RHS>
+        requires (all_or_none<transition_with_guard<LHS>, transition_with_guard<RHS>>())
+        [[nodiscard]] consteval bool operator()(type_tag_t<LHS, RHS>) const noexcept
+        {
+            return std::is_same_v<detail::event_t<LHS>, detail::event_t<RHS>>;
+        }
+    };
+
+    template<typename Current, typename ... Rest>
+    [[nodiscard]] static consteval bool are_all_transitions_unique(type_tag_t<Current, Rest...>) noexcept
+    {
+        return is_transition_unique(transitions_comparator{}, type_tag<Current, Rest...>) && are_all_transitions_unique(type_tag<Rest...>);
+    }
+
+    [[nodiscard]] static consteval bool are_all_transitions_unique(type_tag_t<>) noexcept
+    {
+        return true;
+    }
+
+    template<typename Current, typename ... Rest>
+    [[nodiscard]] static consteval bool is_transition_unique(auto&& comparator, type_tag_t<Current, Rest...>) noexcept
+    {
+        return !(comparator(type_tag<Current, Rest>) || ...);
+    }
+
+    [[nodiscard]] static consteval bool is_transition_unique(auto&&, type_tag_t<>) noexcept
+    {
+        return true;
+    }
+
+public:
+    template<typename State, transition ... Transitions>
+    requires (are_all_transitions_unique(type_tag<Transitions...>))
+    [[nodiscard]] static constexpr state auto create_state(Transitions&&... transitions) noexcept
+    {
+        return internal_state{type_tag<State>, std::forward<Transitions>(transitions)...};
     }
 };
 
